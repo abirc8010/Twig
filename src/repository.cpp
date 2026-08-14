@@ -4,6 +4,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <set>
 #include <sstream>
 
 namespace twig {
@@ -86,17 +88,79 @@ std::vector<std::string> Repository::status() const {
 
     lines.push_back("Current branch: " + current_branch());
 
-    if (!std::filesystem::exists(index_path())) {
-        lines.push_back("No index file present.");
-        return lines;
+    std::map<std::string, std::string> index_entries;
+    if (std::filesystem::exists(index_path())) {
+        std::ifstream index_file(index_path());
+        std::string line;
+        while (std::getline(index_file, line)) {
+            if (line.empty()) {
+                continue;
+            }
+
+            const auto separator = line.find(' ');
+            if (separator == std::string::npos) {
+                continue;
+            }
+
+            const auto path = line.substr(0, separator);
+            const auto hash = line.substr(separator + 1);
+            index_entries[path] = hash;
+        }
     }
 
-    std::ifstream index_file(index_path());
-    std::string line;
-    while (std::getline(index_file, line)) {
-        if (!line.empty()) {
-            lines.push_back(line);
+    std::set<std::string> seen_files;
+    std::filesystem::recursive_directory_iterator it(root_, std::filesystem::directory_options::skip_permission_denied);
+    const std::filesystem::recursive_directory_iterator end;
+
+    for (; it != end; ++it) {
+        const auto current_path = it->path();
+        if (std::filesystem::is_directory(current_path)) {
+            if (current_path.filename() == ".twig") {
+                it.disable_recursion_pending();
+            }
+            continue;
         }
+
+        if (!std::filesystem::is_regular_file(current_path)) {
+            continue;
+        }
+
+        const auto relative = normalize_rel_path(current_path);
+        if (relative.empty() || relative.string() == ".twig") {
+            continue;
+        }
+
+        seen_files.insert(relative.string());
+    }
+
+    bool has_status = false;
+
+    for (const auto& [path, hash] : index_entries) {
+        has_status = true;
+        const auto relative = normalize_rel_path(path);
+        const auto abs_path = root_ / relative;
+
+        if (!std::filesystem::exists(abs_path)) {
+            lines.push_back("deleted: " + relative.string());
+            continue;
+        }
+
+        const auto current_hash = blob_id_for_file(relative);
+        if (current_hash == hash) {
+            lines.push_back("staged: " + relative.string());
+        } else {
+            lines.push_back("modified: " + relative.string());
+        }
+        seen_files.erase(relative.string());
+    }
+
+    for (const auto& path : seen_files) {
+        has_status = true;
+        lines.push_back("untracked: " + path);
+    }
+
+    if (!has_status) {
+        lines.push_back("No tracked files in the index.");
     }
 
     return lines;
@@ -170,12 +234,6 @@ bool Repository::commit(const std::string& message, const std::string& author) {
     }
     ref_file << commit_hash << '\n';
     ref_file.close();
-
-    std::ofstream index_file(index_path(), std::ios::trunc);
-    if (!index_file) {
-        return false;
-    }
-    index_file.close();
 
     return true;
 }
@@ -347,6 +405,10 @@ std::filesystem::path Repository::index_path() const {
 }
 
 std::filesystem::path Repository::normalize_rel_path(std::filesystem::path path) const {
+    if (!path.is_absolute()) {
+        path = root_ / path;
+    }
+
     const auto relative = std::filesystem::relative(path, root_);
     return relative.lexically_normal();
 }
