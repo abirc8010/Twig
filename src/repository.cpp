@@ -192,37 +192,73 @@ bool Repository::add_files(const std::vector<std::filesystem::path>& relative_pa
     auto entries = read_index_entries();
     const auto ignore_patterns = read_ignore_patterns();
     bool all_added = true;
+    std::vector<std::filesystem::path> files_to_stage;
+
+    const auto ignored_by_patterns = [&](const std::filesystem::path& path) {
+        const auto path_string = path.generic_string();
+        for (const auto& pattern : ignore_patterns) {
+            if (pattern.empty() || pattern[0] == '#') {
+                continue;
+            }
+            if ((pattern.back() == '/' && path_string.rfind(pattern.substr(0, pattern.size() - 1), 0) == 0) ||
+                matches_ignore_pattern(path_string, pattern)) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     for (const auto& relative_path : relative_paths) {
         const auto normalized = normalize_rel_path(relative_path);
         const auto abs_path = root_ / normalized;
         std::error_code error;
+        if (std::filesystem::is_directory(abs_path, error)) {
+            if (normalized == ".twig" || ignored_by_patterns(normalized)) {
+                continue;
+            }
+            std::filesystem::recursive_directory_iterator it(
+                abs_path, std::filesystem::directory_options::skip_permission_denied, error);
+            const std::filesystem::recursive_directory_iterator end;
+            if (error) {
+                std::cerr << "Unable to traverse directory: " << normalized << std::endl;
+                all_added = false;
+                continue;
+            }
+            for (; it != end; it.increment(error)) {
+                if (error) {
+                    all_added = false;
+                    error.clear();
+                    continue;
+                }
+                const auto entry_path = it->path();
+                const auto entry_relative = normalize_rel_path(entry_path);
+                std::error_code entry_error;
+                if (it->is_directory(entry_error)) {
+                    if (entry_relative.filename() == ".twig" || ignored_by_patterns(entry_relative)) {
+                        it.disable_recursion_pending();
+                    }
+                    continue;
+                }
+                if (!entry_error && it->is_regular_file(entry_error) && !ignored_by_patterns(entry_relative)) {
+                    files_to_stage.push_back(entry_relative);
+                }
+            }
+            continue;
+        }
+
         if (!std::filesystem::is_regular_file(abs_path, error)) {
             std::cerr << "File not found: " << normalized << std::endl;
             all_added = false;
             continue;
         }
+        files_to_stage.push_back(normalized);
+    }
 
+    for (const auto& normalized : files_to_stage) {
+        const auto abs_path = root_ / normalized;
         const auto normalized_string = normalized.generic_string();
-        bool ignored = false;
-        for (const auto& pattern : ignore_patterns) {
-            if (pattern.empty() || pattern[0] == '#') {
-                continue;
-            }
-            if ((pattern.back() == '/' && normalized_string.rfind(pattern.substr(0, pattern.size() - 1), 0) == 0) ||
-                matches_ignore_pattern(normalized_string, pattern)) {
-                ignored = true;
-                break;
-            }
-        }
-        if (ignored) {
-            if (!quiet) {
-                std::cout << "ignored: " << normalized << std::endl;
-            }
-            all_added = false;
-            continue;
-        }
 
+        std::error_code error;
         const auto file_size = std::filesystem::file_size(abs_path, error);
         if (error || file_size > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max()) ||
             file_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
@@ -425,32 +461,24 @@ bool Repository::merge(const std::string& branch_name) {
 
     const auto current_head = read_head_commit();
     const auto target_head = read_ref_value(target_ref.string());
-    if (current_head.empty() || target_head.empty()) {
+    if (current_head.empty() || target_head.empty() ||
+        current_head == "0000000000000000000000000000000000000000" ||
+        target_head == "0000000000000000000000000000000000000000") {
         return false;
     }
 
-    auto parse_entries = [&](const std::string& commit_hash) {
-        std::map<std::string, std::string> entries;
-        const auto payload = read_object(commit_hash);
-        std::istringstream stream(payload);
-        std::string line;
-        while (std::getline(stream, line)) {
-            if (line.rfind("entry=", 0) == 0) {
-                const auto value = line.substr(6);
-                const auto colon = value.find(':');
-                if (colon != std::string::npos) {
-                    const auto path = value.substr(0, colon);
-                    const auto hash = value.substr(colon + 1);
-                    entries[path] = hash;
-                }
-            }
-        }
-        return entries;
-    };
+    const auto merge_base = find_merge_base(current_head, target_head);
+    if (merge_base.empty()) {
+        return false;
+    }
 
-    const auto current_entries = parse_entries(current_head);
-    const auto target_entries = parse_entries(target_head);
+    const auto base_entries = read_commit_entries(merge_base);
+    const auto current_entries = read_commit_entries(current_head);
+    const auto target_entries = read_commit_entries(target_head);
     std::set<std::string> all_paths;
+    for (const auto& [path, _] : base_entries) {
+        all_paths.insert(path);
+    }
     for (const auto& [path, _] : current_entries) {
         all_paths.insert(path);
     }
@@ -459,42 +487,76 @@ bool Repository::merge(const std::string& branch_name) {
     }
 
     std::map<std::string, std::string> merged_index;
+    std::map<std::string, std::string> merged_contents;
     for (const auto& path : all_paths) {
+        const auto base_it = base_entries.find(path);
         const auto ours_it = current_entries.find(path);
         const auto theirs_it = target_entries.find(path);
-        if (ours_it == current_entries.end()) {
-            merged_index[path] = theirs_it->second;
-            const auto file_path = root_ / normalize_rel_path(path);
-            std::filesystem::create_directories(file_path.parent_path());
-            std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
-            out.write(read_blob(theirs_it->second).data(), static_cast<std::streamsize>(read_blob(theirs_it->second).size()));
-            continue;
-        }
-        if (theirs_it == target_entries.end()) {
-            merged_index[path] = ours_it->second;
-            continue;
-        }
-        if (ours_it->second == theirs_it->second) {
-            merged_index[path] = ours_it->second;
-            continue;
+
+        const bool has_base = base_it != base_entries.end();
+        const bool has_ours = ours_it != current_entries.end();
+        const bool has_theirs = theirs_it != target_entries.end();
+        const std::string base_hash = has_base ? base_it->second : std::string{};
+        const std::string ours_hash = has_ours ? ours_it->second : std::string{};
+        const std::string theirs_hash = has_theirs ? theirs_it->second : std::string{};
+
+        std::string selected_hash;
+        if (has_ours == has_theirs && (!has_ours || ours_hash == theirs_hash)) {
+            if (has_ours) {
+                selected_hash = ours_hash;
+            }
+        } else if (has_ours == has_base && (!has_ours || ours_hash == base_hash)) {
+            if (has_theirs) {
+                selected_hash = theirs_hash;
+            }
+        } else if (has_theirs == has_base && (!has_theirs || theirs_hash == base_hash)) {
+            if (has_ours) {
+                selected_hash = ours_hash;
+            }
+        } else {
+            const auto base_data = has_base ? read_blob(base_hash) : std::string{};
+            const auto ours_data = has_ours ? read_blob(ours_hash) : std::string{};
+            const auto theirs_data = has_theirs ? read_blob(theirs_hash) : std::string{};
+            const auto merged_data = merge_text(base_data, ours_data, theirs_data);
+            if (!write_object("blob", merged_data, selected_hash)) {
+                return false;
+            }
+            merged_contents[path] = merged_data;
         }
 
-        const std::string ours_data = read_blob(ours_it->second);
-        const std::string theirs_data = read_blob(theirs_it->second);
-        const std::string merged_data = merge_text("", ours_data, theirs_data);
+        if (!selected_hash.empty()) {
+            merged_index[path] = selected_hash;
+            if (merged_contents.find(path) == merged_contents.end()) {
+                merged_contents[path] = read_blob(selected_hash);
+            }
+        }
+    }
+
+    for (const auto& path : all_paths) {
         const auto file_path = root_ / normalize_rel_path(path);
-        std::filesystem::create_directories(file_path.parent_path());
+        const auto content_it = merged_contents.find(path);
+        if (content_it == merged_contents.end()) {
+            std::error_code error;
+            std::filesystem::remove(file_path, error);
+            if (error) {
+                return false;
+            }
+            continue;
+        }
+        const auto parent = file_path.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
         std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
-        out.write(merged_data.data(), static_cast<std::streamsize>(merged_data.size()));
-        merged_index[path] = ours_it->second;
+        if (!out) {
+            return false;
+        }
+        out.write(content_it->second.data(), static_cast<std::streamsize>(content_it->second.size()));
+        if (!out) {
+            return false;
+        }
     }
-
-    std::ofstream index_file(index_path(), std::ios::trunc);
-    for (const auto& [path, hash] : merged_index) {
-        index_file << path << ' ' << hash << '\n';
-    }
-    index_file.close();
-    return true;
+    return write_index_entries(merged_index);
 }
 
 std::vector<std::string> Repository::log() const {
@@ -1012,6 +1074,53 @@ std::string Repository::read_ref_value(const std::string& ref_path) const {
     std::string value;
     std::getline(ref_file, value);
     return value;
+}
+
+std::string Repository::find_merge_base(const std::string& first_commit, const std::string& second_commit) const {
+    constexpr const char* zero_hash = "0000000000000000000000000000000000000000";
+    std::map<std::string, size_t> first_ancestors;
+    std::string commit_hash = first_commit;
+    size_t distance = 0;
+    while (!commit_hash.empty() && commit_hash != zero_hash && first_ancestors.emplace(commit_hash, distance).second) {
+        const auto commit = parse_commit(read_object(commit_hash));
+        commit_hash = commit.parent_hash;
+        ++distance;
+    }
+
+    std::string best_common;
+    size_t best_distance = std::numeric_limits<size_t>::max();
+    commit_hash = second_commit;
+    distance = 0;
+    std::set<std::string> visited;
+    while (!commit_hash.empty() && commit_hash != zero_hash && visited.insert(commit_hash).second) {
+        const auto common = first_ancestors.find(commit_hash);
+        if (common != first_ancestors.end() && common->second + distance < best_distance) {
+            best_common = commit_hash;
+            best_distance = common->second + distance;
+        }
+        const auto commit = parse_commit(read_object(commit_hash));
+        commit_hash = commit.parent_hash;
+        ++distance;
+    }
+    return best_common;
+}
+
+std::map<std::string, std::string> Repository::read_commit_entries(const std::string& commit_hash) const {
+    std::map<std::string, std::string> entries;
+    const auto payload = read_object(commit_hash);
+    std::istringstream stream(payload);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line.rfind("entry=", 0) != 0) {
+            continue;
+        }
+        const auto value = line.substr(6);
+        const auto colon = value.find(':');
+        if (colon != std::string::npos) {
+            entries[value.substr(0, colon)] = value.substr(colon + 1);
+        }
+    }
+    return entries;
 }
 
 bool Repository::write_index_from_commit(const std::string& commit_hash) {

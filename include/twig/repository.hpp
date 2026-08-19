@@ -61,6 +61,8 @@ private:
     bool write_object(const std::string& type, const std::string& payload, std::string& object_hash) const;
     CommitInfo parse_commit(const std::string& object_payload) const;
     std::string read_ref_value(const std::string& ref_path) const;
+    std::string find_merge_base(const std::string& first_commit, const std::string& second_commit) const;
+    std::map<std::string, std::string> read_commit_entries(const std::string& commit_hash) const;
     bool write_index_from_commit(const std::string& commit_hash);
     std::vector<std::string> read_ignore_patterns() const;
     bool matches_ignore_pattern(const std::string& path, const std::string& pattern) const;
