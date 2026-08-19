@@ -1,14 +1,41 @@
 #include "twig/repository.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
+#include <cstdlib>
+#include <utility>
 
 namespace twig {
+
+namespace {
+
+std::string shell_quote(const std::filesystem::path& value) {
+    const auto raw = value.string();
+    std::string quoted = "'";
+    for (char ch : raw) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+bool git_available() {
+    return std::system("git --version >/dev/null 2>&1") == 0;
+}
+
+}  // namespace
 
 Repository::Repository(std::filesystem::path root)
     : root_(std::move(root)), dot_twig_(root_ / ".twig") {}
@@ -88,25 +115,7 @@ std::vector<std::string> Repository::status() const {
 
     lines.push_back("Current branch: " + current_branch());
 
-    std::map<std::string, std::string> index_entries;
-    if (std::filesystem::exists(index_path())) {
-        std::ifstream index_file(index_path());
-        std::string line;
-        while (std::getline(index_file, line)) {
-            if (line.empty()) {
-                continue;
-            }
-
-            const auto separator = line.find(' ');
-            if (separator == std::string::npos) {
-                continue;
-            }
-
-            const auto path = line.substr(0, separator);
-            const auto hash = line.substr(separator + 1);
-            index_entries[path] = hash;
-        }
-    }
+    std::map<std::string, std::string> index_entries = read_index_entries();
 
     std::set<std::string> seen_files;
     std::filesystem::recursive_directory_iterator it(root_, std::filesystem::directory_options::skip_permission_denied);
@@ -127,6 +136,10 @@ std::vector<std::string> Repository::status() const {
 
         const auto relative = normalize_rel_path(current_path);
         if (relative.empty() || relative.string() == ".twig") {
+            continue;
+        }
+
+        if (is_ignored(relative)) {
             continue;
         }
 
@@ -166,41 +179,96 @@ std::vector<std::string> Repository::status() const {
     return lines;
 }
 
-void Repository::add_file(const std::filesystem::path& relative_path) {
+bool Repository::add_file(const std::filesystem::path& relative_path, bool quiet) {
+    return add_files({relative_path}, quiet);
+}
+
+bool Repository::add_files(const std::vector<std::filesystem::path>& relative_paths, bool quiet) {
     if (!is_initialized()) {
         std::cerr << "Repository is not initialized" << std::endl;
-        return;
+        return false;
     }
 
-    const auto normalized = normalize_rel_path(relative_path);
-    const auto abs_path = root_ / normalized;
-    if (!std::filesystem::exists(abs_path) || std::filesystem::is_directory(abs_path)) {
-        std::cerr << "File not found: " << normalized << std::endl;
-        return;
+    auto entries = read_index_entries();
+    const auto ignore_patterns = read_ignore_patterns();
+    bool all_added = true;
+
+    for (const auto& relative_path : relative_paths) {
+        const auto normalized = normalize_rel_path(relative_path);
+        const auto abs_path = root_ / normalized;
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(abs_path, error)) {
+            std::cerr << "File not found: " << normalized << std::endl;
+            all_added = false;
+            continue;
+        }
+
+        const auto normalized_string = normalized.generic_string();
+        bool ignored = false;
+        for (const auto& pattern : ignore_patterns) {
+            if (pattern.empty() || pattern[0] == '#') {
+                continue;
+            }
+            if ((pattern.back() == '/' && normalized_string.rfind(pattern.substr(0, pattern.size() - 1), 0) == 0) ||
+                matches_ignore_pattern(normalized_string, pattern)) {
+                ignored = true;
+                break;
+            }
+        }
+        if (ignored) {
+            if (!quiet) {
+                std::cout << "ignored: " << normalized << std::endl;
+            }
+            all_added = false;
+            continue;
+        }
+
+        const auto file_size = std::filesystem::file_size(abs_path, error);
+        if (error || file_size > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max()) ||
+            file_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+            std::cerr << "Unable to determine file size: " << normalized << std::endl;
+            all_added = false;
+            continue;
+        }
+
+        std::string content(static_cast<size_t>(file_size), '\0');
+        std::ifstream input(abs_path, std::ios::binary);
+        if (!input || (!content.empty() && !input.read(content.data(), static_cast<std::streamsize>(content.size())))) {
+            std::cerr << "Unable to read file: " << normalized << std::endl;
+            all_added = false;
+            continue;
+        }
+
+        std::string blob_id;
+        if (!write_object("blob", content, blob_id)) {
+            all_added = false;
+            continue;
+        }
+        entries[normalized_string] = blob_id;
+        if (!quiet) {
+            std::cout << "staged: " << normalized << " -> " << blob_id << std::endl;
+        }
     }
 
-    const auto blob_id = blob_id_for_file(normalized);
-
-    std::ofstream index_file(index_path(), std::ios::app);
-    if (!index_file) {
-        std::cerr << "Unable to open index." << std::endl;
-        return;
-    }
-
-    index_file << normalized.string() << ' ' << blob_id << '\n';
-    std::cout << "staged: " << normalized << " -> " << blob_id << std::endl;
+    return write_index_entries(entries) && all_added;
 }
 
 std::string Repository::blob_id_for_file(const std::filesystem::path& relative_path) const {
     const auto abs_path = root_ / normalize_rel_path(relative_path);
-    std::ifstream file(abs_path, std::ios::binary);
-    if (!file) {
+    std::error_code error;
+    const auto file_size = std::filesystem::file_size(abs_path, error);
+    if (error || file_size > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max()) ||
+        file_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
         return "missing";
     }
 
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    return hash_bytes(buffer.str());
+    std::string content(static_cast<size_t>(file_size), '\0');
+    std::ifstream file(abs_path, std::ios::binary);
+    if (!file || (!content.empty() && !file.read(content.data(), static_cast<std::streamsize>(content.size())))) {
+        return "missing";
+    }
+    const auto object_data = "blob " + std::to_string(content.size()) + "\n" + content;
+    return hash_bytes(object_data);
 }
 
 bool Repository::commit(const std::string& message, const std::string& author) {
@@ -208,7 +276,15 @@ bool Repository::commit(const std::string& message, const std::string& author) {
         return false;
     }
 
-    const auto tree_hash = write_tree();
+    const auto entries = read_index_entries();
+    std::string tree_payload;
+    for (const auto& [path, blob_hash] : entries) {
+        tree_payload += path + " " + blob_hash + "\n";
+    }
+    std::string tree_hash;
+    if (!write_object("tree", tree_payload, tree_hash)) {
+        return false;
+    }
     const auto parent_hash = read_head_commit();
     const auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -221,6 +297,10 @@ bool Repository::commit(const std::string& message, const std::string& author) {
     payload += "author=" + author + "\n";
     payload += "timestamp=" + std::to_string(timestamp) + "\n";
     payload += "message=" + message + "\n";
+
+    for (const auto& [path, blob_hash] : entries) {
+        payload += "entry=" + path + ":" + blob_hash + "\n";
+    }
 
     std::string commit_hash;
     if (!write_object("commit", payload, commit_hash)) {
@@ -235,6 +315,185 @@ bool Repository::commit(const std::string& message, const std::string& author) {
     ref_file << commit_hash << '\n';
     ref_file.close();
 
+    return true;
+}
+
+bool Repository::branch(const std::string& name) const {
+    if (!is_initialized() || name.empty()) {
+        return false;
+    }
+
+    const auto branch_path = branch_ref_path(name);
+    if (std::filesystem::exists(branch_path)) {
+        return false;
+    }
+
+    const auto current_hash = read_head_commit();
+    std::ofstream ref_file(branch_path, std::ios::trunc);
+    if (!ref_file) {
+        return false;
+    }
+    ref_file << (current_hash.empty() ? "0000000000000000000000000000000000000000" : current_hash) << '\n';
+    return true;
+}
+
+bool Repository::checkout(const std::string& target) {
+    if (!is_initialized() || target.empty()) {
+        return false;
+    }
+
+    std::string commit_hash = target;
+    std::string branch_name = target;
+
+    const auto target_branch_path = branch_ref_path(target);
+    if (std::filesystem::exists(target_branch_path)) {
+        commit_hash = read_ref_value(target_branch_path.string());
+        branch_name = target;
+    } else {
+        const auto branch_ref = read_ref_value((refs_dir() / "heads" / target).string());
+        if (!branch_ref.empty()) {
+            commit_hash = branch_ref;
+            branch_name = target;
+        }
+    }
+
+    if (commit_hash.empty() || commit_hash == "0000000000000000000000000000000000000000") {
+        auto head_file = std::ofstream(head_path(), std::ios::trunc);
+        if (branch_name != current_branch()) {
+            head_file << "refs/heads/" + branch_name + "\n";
+        }
+        return true;
+    }
+
+    const auto payload = read_object(commit_hash);
+    if (payload.empty()) {
+        return false;
+    }
+
+    std::map<std::string, std::string> entries;
+    std::istringstream stream(payload);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line.rfind("entry=", 0) == 0) {
+            const auto value = line.substr(6);
+            const auto colon = value.find(':');
+            if (colon != std::string::npos) {
+                const auto path = value.substr(0, colon);
+                const auto blob_hash = value.substr(colon + 1);
+                entries[path] = blob_hash;
+            }
+        }
+    }
+
+    std::ofstream index_file(index_path(), std::ios::trunc);
+    for (const auto& [path, blob_hash] : entries) {
+        const auto normalized = normalize_rel_path(path);
+        const auto file_path = root_ / normalized;
+        const auto parent = file_path.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+
+        const auto blob_data = read_blob(blob_hash);
+        std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out.write(blob_data.data(), static_cast<std::streamsize>(blob_data.size()));
+        }
+
+        index_file << path << ' ' << blob_hash << '\n';
+    }
+    index_file.close();
+
+    const auto head_target = branch_ref_path(branch_name);
+    if (std::filesystem::exists(head_target)) {
+        std::ofstream head_out(head_path(), std::ios::trunc);
+        head_out << "refs/heads/" + branch_name + "\n";
+    }
+
+    return true;
+}
+
+bool Repository::merge(const std::string& branch_name) {
+    if (!is_initialized() || branch_name.empty()) {
+        return false;
+    }
+
+    const auto target_ref = branch_ref_path(branch_name);
+    if (!std::filesystem::exists(target_ref)) {
+        return false;
+    }
+
+    const auto current_head = read_head_commit();
+    const auto target_head = read_ref_value(target_ref.string());
+    if (current_head.empty() || target_head.empty()) {
+        return false;
+    }
+
+    auto parse_entries = [&](const std::string& commit_hash) {
+        std::map<std::string, std::string> entries;
+        const auto payload = read_object(commit_hash);
+        std::istringstream stream(payload);
+        std::string line;
+        while (std::getline(stream, line)) {
+            if (line.rfind("entry=", 0) == 0) {
+                const auto value = line.substr(6);
+                const auto colon = value.find(':');
+                if (colon != std::string::npos) {
+                    const auto path = value.substr(0, colon);
+                    const auto hash = value.substr(colon + 1);
+                    entries[path] = hash;
+                }
+            }
+        }
+        return entries;
+    };
+
+    const auto current_entries = parse_entries(current_head);
+    const auto target_entries = parse_entries(target_head);
+    std::set<std::string> all_paths;
+    for (const auto& [path, _] : current_entries) {
+        all_paths.insert(path);
+    }
+    for (const auto& [path, _] : target_entries) {
+        all_paths.insert(path);
+    }
+
+    std::map<std::string, std::string> merged_index;
+    for (const auto& path : all_paths) {
+        const auto ours_it = current_entries.find(path);
+        const auto theirs_it = target_entries.find(path);
+        if (ours_it == current_entries.end()) {
+            merged_index[path] = theirs_it->second;
+            const auto file_path = root_ / normalize_rel_path(path);
+            std::filesystem::create_directories(file_path.parent_path());
+            std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+            out.write(read_blob(theirs_it->second).data(), static_cast<std::streamsize>(read_blob(theirs_it->second).size()));
+            continue;
+        }
+        if (theirs_it == target_entries.end()) {
+            merged_index[path] = ours_it->second;
+            continue;
+        }
+        if (ours_it->second == theirs_it->second) {
+            merged_index[path] = ours_it->second;
+            continue;
+        }
+
+        const std::string ours_data = read_blob(ours_it->second);
+        const std::string theirs_data = read_blob(theirs_it->second);
+        const std::string merged_data = merge_text("", ours_data, theirs_data);
+        const auto file_path = root_ / normalize_rel_path(path);
+        std::filesystem::create_directories(file_path.parent_path());
+        std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+        out.write(merged_data.data(), static_cast<std::streamsize>(merged_data.size()));
+        merged_index[path] = ours_it->second;
+    }
+
+    std::ofstream index_file(index_path(), std::ios::trunc);
+    for (const auto& [path, hash] : merged_index) {
+        index_file << path << ' ' << hash << '\n';
+    }
+    index_file.close();
     return true;
 }
 
@@ -271,15 +530,25 @@ std::string Repository::read_head_commit() const {
     return value;
 }
 
-std::string Repository::write_tree() const {
-    std::ifstream index_file(index_path());
-    std::string entry_payload;
-    std::string line;
+std::vector<std::string> Repository::list_branches() const {
+    std::vector<std::string> branches;
+    const auto heads_dir = refs_dir() / "heads";
+    if (!std::filesystem::exists(heads_dir)) {
+        return branches;
+    }
 
-    while (std::getline(index_file, line)) {
-        if (!line.empty()) {
-            entry_payload += line + "\n";
+    for (const auto& entry : std::filesystem::directory_iterator(heads_dir)) {
+        if (entry.is_regular_file()) {
+            branches.push_back(entry.path().filename().string());
         }
+    }
+    return branches;
+}
+
+std::string Repository::write_tree() const {
+    std::string entry_payload;
+    for (const auto& [path, blob_hash] : read_index_entries()) {
+        entry_payload += path + " " + blob_hash + "\n";
     }
 
     std::string tree_hash;
@@ -298,6 +567,343 @@ std::string Repository::hash_bytes(std::string_view content) {
 
     std::ostringstream out;
     out << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return out.str();
+}
+
+std::string Repository::benchmark_hash_pipeline(size_t file_count, size_t file_size_bytes) {
+    const auto bench_root = std::filesystem::temp_directory_path() / "twig-benchmark";
+    const auto twig_root = bench_root / "twig-bench";
+    const auto git_root = bench_root / "git-bench";
+    std::filesystem::remove_all(bench_root);
+    std::filesystem::create_directories(twig_root);
+    std::filesystem::create_directories(git_root);
+
+    Repository twig_repo(twig_root);
+    if (!twig_repo.init()) {
+        std::filesystem::remove_all(bench_root);
+        return "benchmark: files=" + std::to_string(file_count) + ", bytes_per_file=" +
+               std::to_string(file_size_bytes) + ", twig_elapsed_ms=unavailable, git_elapsed_ms=unavailable, "
+               "throughput_mb_s=unavailable, git_status=twig-init-failed";
+    }
+
+    const bool has_git = git_available();
+    if (has_git) {
+        const auto git_init = "git -C " + shell_quote(git_root) + " init --quiet >/dev/null 2>&1";
+        if (std::system(git_init.c_str()) != 0) {
+            std::filesystem::remove_all(bench_root);
+            return "benchmark: files=" + std::to_string(file_count) + ", bytes_per_file=" +
+                   std::to_string(file_size_bytes) + ", twig_elapsed_ms=unavailable, git_elapsed_ms=unavailable, "
+                   "throughput_mb_s=unavailable, git_status=git-init-failed";
+        }
+    }
+
+    for (size_t i = 0; i < file_count; ++i) {
+        std::string data(file_size_bytes, 'x');
+        if (!data.empty()) {
+            auto value = i;
+            for (size_t j = 0; j < sizeof(value) && j < data.size(); ++j) {
+                data[j] = static_cast<char>(value & 0xff);
+                value >>= 8;
+            }
+        }
+
+        const auto filename = "file-" + std::to_string(i) + ".dat";
+        for (const auto& repo_root : {twig_root, git_root}) {
+            std::ofstream file(repo_root / filename, std::ios::binary | std::ios::trunc);
+            if (!file) {
+                std::filesystem::remove_all(bench_root);
+                return "benchmark: files=" + std::to_string(file_count) + ", bytes_per_file=" +
+                       std::to_string(file_size_bytes) + ", twig_elapsed_ms=unavailable, git_elapsed_ms=unavailable, "
+                       "throughput_mb_s=unavailable, git_status=file-setup-failed";
+            }
+            file.write(data.data(), static_cast<std::streamsize>(data.size()));
+            if (!file) {
+                std::filesystem::remove_all(bench_root);
+                return "benchmark: files=" + std::to_string(file_count) + ", bytes_per_file=" +
+                       std::to_string(file_size_bytes) + ", twig_elapsed_ms=unavailable, git_elapsed_ms=unavailable, "
+                       "throughput_mb_s=unavailable, git_status=file-setup-failed";
+            }
+        }
+    }
+
+    std::vector<std::filesystem::path> twig_paths;
+    twig_paths.reserve(file_count);
+    for (size_t i = 0; i < file_count; ++i) {
+        twig_paths.emplace_back("file-" + std::to_string(i) + ".dat");
+    }
+    const auto twig_start = std::chrono::steady_clock::now();
+    bool twig_ok = twig_repo.add_files(twig_paths, true);
+    if (twig_ok) {
+        twig_ok = twig_repo.commit("benchmark snapshot", "Twig Benchmark <benchmark@local>");
+    }
+    const auto twig_duration = std::chrono::steady_clock::now() - twig_start;
+    const auto twig_elapsed_ms = std::chrono::duration<double, std::milli>(twig_duration).count();
+
+    bool git_ok = false;
+    std::chrono::duration<double, std::milli> git_duration{0};
+    if (has_git) {
+        const auto git_command = "git -C " + shell_quote(git_root) + " add . && git -C " + shell_quote(git_root) +
+                                 " -c user.name=TwigBenchmark -c user.email=benchmark@local commit -m bench --quiet "
+                                 ">/dev/null 2>&1";
+        const auto git_start = std::chrono::steady_clock::now();
+        git_ok = std::system(git_command.c_str()) == 0;
+        git_duration = std::chrono::steady_clock::now() - git_start;
+    }
+
+    const auto git_elapsed_ms = git_duration.count();
+    const auto total_mb = static_cast<long double>(file_count) * static_cast<long double>(file_size_bytes) /
+                          1000000.0L;
+    const auto twig_throughput = twig_elapsed_ms > 0.0 ? total_mb / (twig_elapsed_ms / 1000.0) : 0.0L;
+    const auto git_throughput = git_ok && git_elapsed_ms > 0.0 ? total_mb / (git_elapsed_ms / 1000.0) : 0.0L;
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3) << "benchmark: files=" << file_count
+        << ", bytes_per_file=" << file_size_bytes << ", twig_elapsed_ms=";
+    if (twig_ok) {
+        out << twig_elapsed_ms;
+    } else {
+        out << "unavailable";
+    }
+    out << ", git_elapsed_ms=";
+    if (git_ok) {
+        out << git_elapsed_ms;
+    } else {
+        out << "unavailable";
+    }
+    out << ", throughput_mb_s=twig:" << twig_throughput << ",git:";
+    if (git_ok) {
+        out << git_throughput;
+    } else {
+        out << "unavailable";
+    }
+    out << ", git_status=" << (!has_git ? "unavailable" : (git_ok ? "available" : "git-benchmark-failed"));
+
+    std::filesystem::remove_all(bench_root);
+    return out.str();
+}
+
+bool Repository::is_ignored(const std::filesystem::path& relative_path) const {
+    const auto normalized = normalize_rel_path(relative_path);
+    const auto path_string = normalized.string();
+    if (path_string.empty()) {
+        return false;
+    }
+
+    for (const auto& pattern : read_ignore_patterns()) {
+        if (pattern.empty() || pattern[0] == '#') {
+            continue;
+        }
+
+        if (pattern.back() == '/' && path_string.rfind(pattern.substr(0, pattern.size() - 1), 0) == 0) {
+            return true;
+        }
+
+        if (matches_ignore_pattern(path_string, pattern)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::vector<std::string> Repository::diff_file(const std::filesystem::path& relative_path) const {
+    const auto normalized = normalize_rel_path(relative_path);
+    const auto abs_path = root_ / normalized;
+    if (!std::filesystem::exists(abs_path)) {
+        return {};
+    }
+
+    const auto entries = read_index_entries();
+    const auto it = entries.find(normalized.string());
+    if (it == entries.end()) {
+        return {};
+    }
+
+    const std::string old_text = read_blob(it->second);
+    const std::string new_text = read_file_contents(abs_path);
+    return compute_line_diff(old_text, new_text);
+}
+
+std::vector<std::string> Repository::read_ignore_patterns() const {
+    std::vector<std::string> patterns;
+    const auto ignore_path = root_ / ".twigignore";
+    if (!std::filesystem::exists(ignore_path)) {
+        return patterns;
+    }
+
+    std::ifstream input(ignore_path);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty()) {
+            patterns.push_back(line);
+        }
+    }
+    return patterns;
+}
+
+bool Repository::matches_ignore_pattern(const std::string& path, const std::string& pattern) const {
+    if (pattern.empty()) {
+        return false;
+    }
+
+    if (pattern.find('*') == std::string::npos) {
+        return path == pattern || path.find(pattern) != std::string::npos;
+    }
+
+    std::function<bool(size_t, size_t)> match = [&](size_t i, size_t j) -> bool {
+        if (j == pattern.size()) {
+            return i == path.size();
+        }
+        if (pattern[j] == '*') {
+            return match(i, j + 1) || (i < path.size() && match(i + 1, j));
+        }
+        return i < path.size() && pattern[j] == path[i] && match(i + 1, j + 1);
+    };
+
+    return match(0, 0);
+}
+
+std::map<std::string, std::string> Repository::read_index_entries() const {
+    std::map<std::string, std::string> entries;
+    if (!std::filesystem::exists(index_path())) {
+        return entries;
+    }
+
+    std::ifstream index_file(index_path());
+    std::string line;
+    while (std::getline(index_file, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        const auto separator = line.find(' ');
+        if (separator == std::string::npos) {
+            continue;
+        }
+
+        const auto path = line.substr(0, separator);
+        const auto hash = line.substr(separator + 1);
+        entries[path] = hash;
+    }
+    return entries;
+}
+
+bool Repository::write_index_entries(const std::map<std::string, std::string>& entries) const {
+    std::ofstream index_file(index_path(), std::ios::trunc);
+    if (!index_file) {
+        std::cerr << "Unable to open index." << std::endl;
+        return false;
+    }
+    for (const auto& [path, hash] : entries) {
+        index_file << path << ' ' << hash << '\n';
+    }
+    return static_cast<bool>(index_file);
+}
+
+std::string Repository::read_file_contents(const std::filesystem::path& path) const {
+    std::error_code error;
+    const auto file_size = std::filesystem::file_size(path, error);
+    if (error || file_size > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max()) ||
+        file_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+        return "";
+    }
+
+    std::string content(static_cast<size_t>(file_size), '\0');
+    std::ifstream input(path, std::ios::binary);
+    if (!input || (!content.empty() && !input.read(content.data(), static_cast<std::streamsize>(content.size())))) {
+        return "";
+    }
+    return content;
+}
+
+std::vector<std::string> Repository::compute_line_diff(const std::string& old_text, const std::string& new_text) const {
+    std::vector<std::string> old_lines;
+    std::vector<std::string> new_lines;
+    std::stringstream old_stream(old_text);
+    std::stringstream new_stream(new_text);
+    std::string line;
+    while (std::getline(old_stream, line)) {
+        old_lines.push_back(line);
+    }
+    while (std::getline(new_stream, line)) {
+        new_lines.push_back(line);
+    }
+
+    const size_t rows = old_lines.size() + 1;
+    const size_t cols = new_lines.size() + 1;
+    std::vector<std::vector<int>> dp(rows, std::vector<int>(cols, 0));
+
+    for (size_t i = 1; i < rows; ++i) {
+        for (size_t j = 1; j < cols; ++j) {
+            if (old_lines[i - 1] == new_lines[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = std::max(dp[i - 1][j], dp[i][j - 1]);
+            }
+        }
+    }
+
+    std::vector<std::string> result;
+    size_t i = old_lines.size();
+    size_t j = new_lines.size();
+    while (i > 0 && j > 0) {
+        if (old_lines[i - 1] == new_lines[j - 1]) {
+            result.push_back(" " + old_lines[i - 1]);
+            --i;
+            --j;
+        } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+            result.push_back("-" + old_lines[i - 1]);
+            --i;
+        } else {
+            result.push_back("+" + new_lines[j - 1]);
+            --j;
+        }
+    }
+
+    while (i > 0) {
+        result.push_back("-" + old_lines[i - 1]);
+        --i;
+    }
+    while (j > 0) {
+        result.push_back("+" + new_lines[j - 1]);
+        --j;
+    }
+
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+
+std::string Repository::read_blob_from_path(const std::filesystem::path& path) const {
+    const auto normalized = normalize_rel_path(path);
+    const auto entries = read_index_entries();
+    const auto it = entries.find(normalized.string());
+    if (it == entries.end()) {
+        return "";
+    }
+    return read_blob(it->second);
+}
+
+std::string Repository::merge_text(const std::string& base_text, const std::string& ours_text, const std::string& theirs_text) const {
+    if (base_text == ours_text) {
+        return theirs_text;
+    }
+    if (base_text == theirs_text) {
+        return ours_text;
+    }
+    if (ours_text == theirs_text) {
+        return ours_text;
+    }
+
+    std::ostringstream out;
+    out << "<<<<<<< HEAD\n" << ours_text;
+    if (!ours_text.empty() && ours_text.back() != '\n') {
+        out << '\n';
+    }
+    out << "=======\n" << theirs_text;
+    if (!theirs_text.empty() && theirs_text.back() != '\n') {
+        out << '\n';
+    }
+    out << ">>>>>>> merge\n";
     return out.str();
 }
 
@@ -325,6 +931,19 @@ std::string Repository::read_object(const std::string& object_hash) const {
     std::ostringstream buffer;
     buffer << file.rdbuf();
     return buffer.str();
+}
+
+std::string Repository::read_blob(const std::string& object_hash) const {
+    const auto raw = read_object(object_hash);
+    if (raw.empty()) {
+        return "";
+    }
+
+    const auto newline_pos = raw.find('\n');
+    if (newline_pos == std::string::npos) {
+        return raw;
+    }
+    return raw.substr(newline_pos + 1);
 }
 
 std::filesystem::path Repository::object_path_for_hash(const std::string& object_hash) const {
@@ -384,6 +1003,40 @@ CommitInfo Repository::parse_commit(const std::string& object_payload) const {
     return info;
 }
 
+std::string Repository::read_ref_value(const std::string& ref_path) const {
+    std::ifstream ref_file(ref_path);
+    if (!ref_file) {
+        return "";
+    }
+
+    std::string value;
+    std::getline(ref_file, value);
+    return value;
+}
+
+bool Repository::write_index_from_commit(const std::string& commit_hash) {
+    const auto payload = read_object(commit_hash);
+    if (payload.empty()) {
+        return false;
+    }
+
+    std::ofstream index_file(index_path(), std::ios::trunc);
+    std::istringstream stream(payload);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line.rfind("entry=", 0) == 0) {
+            const auto value = line.substr(6);
+            const auto colon = value.find(':');
+            if (colon != std::string::npos) {
+                const auto path = value.substr(0, colon);
+                const auto blob_hash = value.substr(colon + 1);
+                index_file << path << ' ' << blob_hash << '\n';
+            }
+        }
+    }
+    return true;
+}
+
 std::filesystem::path Repository::object_dir() const {
     return dot_twig_ / "objects";
 }
@@ -406,10 +1059,9 @@ std::filesystem::path Repository::index_path() const {
 
 std::filesystem::path Repository::normalize_rel_path(std::filesystem::path path) const {
     if (!path.is_absolute()) {
-        path = root_ / path;
+        return path.lexically_normal();
     }
-
-    const auto relative = std::filesystem::relative(path, root_);
+    const auto relative = path.lexically_normal().lexically_relative(root_.lexically_normal());
     return relative.lexically_normal();
 }
 

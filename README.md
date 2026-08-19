@@ -1,67 +1,19 @@
 # Twig
 
-Twig is a lightweight custom version control system written in modern C++20. The goal is to model the same core ideas behind Git: content-addressable objects, a Merkle-style DAG, a working tree, and a branch-based commit history.
+Twig is a lightweight Git-like version control system implemented in modern C++20. It is built as a learning project with a focus on the core mechanics of a VCS: repositories, content-addressed storage, staging, commit history, branching, diffing, and basic merge workflows.
 
-## Project philosophy
+## What this project demonstrates
 
-Twig is intentionally designed as a learning and portfolio project. It avoids paid services and external cloud dependencies. The implementation focuses on:
+- repository initialization under a hidden `.twig/` directory
+- working tree status detection
+- index-based staging
+- commit DAG with branch references
+- branch creation and checkout
+- minimal diff and merge flows
+- `.twigignore` handling
+- Git-vs-Twig benchmarking for hash throughput
 
-- a hidden `.twig/` repository directory
-- object storage under `.twig/objects/`
-- tree and commit metadata
-- efficient local file hashing and staging
-- a clean CLI built around `twig <command>`
-
-## Command surface
-
-The first version focuses on the repository lifecycle and the VCS building blocks:
-
-- `twig init`
-- `twig status`
-- `twig add <file...>`
-- `twig log`
-- `twig help`
-
-## Core object model
-
-Twig follows the same conceptual object model as Git:
-
-- Blob: file content stored by hash
-- Tree: directory snapshot and references to child objects
-- Commit: metadata + parent pointer + tree root
-- Branch: lightweight pointer to a commit
-
-This is the foundation for the roadmap below.
-
-## Roadmap
-
-### Phase 1: repository bootstrapping
-- create `.twig/`
-- create `objects/`, `refs/heads/`, and `HEAD`
-- track current branch as `main`
-- implement repository initialization and filesystem checks
-
-### Phase 2: index and trees
-- stage file paths and hashes
-- create tree structures from the index
-- support directory snapshots and path tracking
-
-### Phase 3: commit history
-- write commit objects with parent links and metadata
-- update branch refs
-- walk the history DAG in `twig log`
-
-### Phase 4: checkout and branching
-- switch branches and restore snapshots
-- map commit IDs to tree roots
-- verify working-tree safety
-
-### Phase 5: diff and merge
-- line-based diffing using Myers algorithm or a simpler fallback
-- LCA-based merge logic for non-conflicting changes
-- conflict reporting and branch safety
-
-## Local build
+## Quick start
 
 ```bash
 cmake -S . -B build
@@ -69,6 +21,79 @@ cmake --build build
 ./build/twig init
 ```
 
-## Notes
+## Common commands
 
-This repository begins with a clean C++20 scaffold and intentionally keeps the implementation understandable. The object and commit pipeline is designed to be expanded toward a real Git-like VCS without requiring large frameworks or proprietary tooling.
+```bash
+./build/twig status
+./build/twig add hello.txt
+./build/twig commit -m "initial snapshot"
+./build/twig branch feature
+./build/twig checkout feature
+./build/twig diff hello.txt
+./build/twig merge main
+./build/twig log
+./build/twig benchmark 200 256
+```
+
+## Repository layout
+
+```text
+repo/
+├── .twig/
+│   ├── HEAD
+│   ├── index
+│   ├── objects/
+│   └── refs/
+│       └── heads/
+├── .twigignore
+├── tracked-file.txt
+└── working-tree-files...
+```
+
+## Benchmarking against Git
+
+The benchmark command compares a real Twig snapshot workload with a Git snapshot workload. Both repositories are initialized and receive the same synthetic files before timing begins. The timed work is Twig file-backed staging plus commit versus Git `add .` plus commit; repository initialization and input-file generation are excluded.
+
+```bash
+./build/twig benchmark 200 256
+```
+
+Output reports the file count, bytes per file, elapsed time for Twig and Git, both throughputs in the `throughput_mb_s=twig:<value>,git:<value>` field, and `git_status`. Benchmark staging output is suppressed. Git must be installed for the comparison; otherwise its timing and throughput are reported as unavailable.
+
+Verified example from this run (timings vary by machine):
+
+```text
+benchmark: files=200, bytes_per_file=256, twig_elapsed_ms=12.840, git_elapsed_ms=16.579, throughput_mb_s=twig:3.988,git:3.088, git_status=available
+```
+
+This is a controlled synthetic add-and-snapshot comparison, not a production-grade performance claim. Twig and Git use different hashing and object-storage implementations.
+
+## Design notes
+
+Twig follows the same conceptual model as Git:
+
+- Blob = file content addressed by hash
+- Tree = staged snapshot of files
+- Commit = metadata + parent + tree reference
+- Branch = pointer to a commit
+
+The implementation is intentionally small and readable so the core mechanics are easy to follow.
+
+## Validation
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+The project uses CMake and includes a basic repository regression test suite. A sanitizer-enabled configuration is also supported:
+
+```bash
+cmake -S . -B build -DTWIG_ENABLE_ASAN=ON
+cmake --build build
+```
+
+## Current maturity
+
+Twig is not a drop-in replacement for Git. It is a compact, working VCS prototype aimed at demonstrating how a Git-like system can be built and benchmarked in a single project. It is intentionally strong on concept clarity and extension potential, while staying small enough to understand in one pass.
+
+See [Architecture.md](Architecture.md) for a deeper explanation of the repository model and execution flow.

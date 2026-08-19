@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(TWIG_ENABLE_ASAN "Enable AddressSanitizer and UBSan" OFF)
+
 enable_testing()
 
 add_executable(twig
@@ -29,6 +31,20 @@ target_include_directories(twig_test
 )
 
 add_test(NAME twig_repository_test COMMAND twig_test)
+
+if(TWIG_ENABLE_ASAN)
+    if(MSVC)
+        target_compile_options(twig PRIVATE /fsanitize=address)
+        target_link_options(twig PRIVATE /fsanitize=address)
+        target_compile_options(twig_test PRIVATE /fsanitize=address)
+        target_link_options(twig_test PRIVATE /fsanitize=address)
+    else()
+        target_compile_options(twig PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(twig PRIVATE -fsanitize=address,undefined)
+        target_compile_options(twig_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(twig_test PRIVATE -fsanitize=address,undefined)
+    endif()
+endif()
 
 if(MSVC)
     target_compile_options(twig PRIVATE /W4)
