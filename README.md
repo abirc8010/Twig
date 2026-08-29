@@ -61,39 +61,74 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+### Install `twig` for terminal-wide use (Linux)
+
+Install the executable into `~/.local/bin`:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix "$HOME/.local"
+```
+
+Make sure `~/.local/bin` is on your `PATH`. For Bash, add this once to `~/.bashrc` if it is not already present:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Reload the shell configuration or open a new terminal, then check `command -v twig`. You can now use Twig from any working directory:
+
+```bash
+mkdir my-project
+cd my-project
+twig init
+twig status
+```
+
+To update the installed executable after rebuilding, run `cmake --build build` followed by `cmake --install build --prefix "$HOME/.local"` again. To uninstall this user-local copy, remove `~/.local/bin/twig`.
+
+You can also use the included uninstall script:
+
+```bash
+bash scripts/uninstall.sh
+```
+
+It removes only `~/.local/bin/twig`. If you installed to a different prefix, pass it as the first argument (for example, `bash scripts/uninstall.sh /opt/twig`). It does not remove any `.twig/` repository metadata or project files.
+
 ---
 
 ## CLI Usage & Quickstart
 
 ```bash
 # 1. Initialize a new Twig repository
-./build/twig init
+twig init  # after installation above
 
 # 2. Stage individual files or recursively stage a directory
-./build/twig add README.md src/
+twig add README.md src/
 # or stage everything respecting .twigignore:
-./build/twig add .
+twig add .
 
 # 3. Check working tree and staging status
-./build/twig status
+twig status
 
 # 4. Create a commit snapshot
-./build/twig commit -m "Initial project snapshot" --author "Abir <abir@local>"
+twig commit -m "Initial project snapshot" --author "Abir <abir@local>"
 
 # 5. View commit history
-./build/twig log
+twig log
 
 # 6. Inspect line-by-line changes before staging
-./build/twig diff README.md
+twig diff README.md
 
 # 7. Create, list, and switch branches
-./build/twig branch feature-x
-./build/twig branch
-./build/twig checkout feature-x
+twig branch feature-x
+twig branch
+twig checkout feature-x
 
 # 8. Merge a branch into the current branch using 3-way LCA merge
-./build/twig checkout main
-./build/twig merge feature-x
+twig checkout main
+twig merge feature-x
 ```
 
 ---
@@ -103,7 +138,7 @@ ctest --test-dir build --output-on-failure
 `twig benchmark [files=1000] [size=1024]` runs an isolated end-to-end staging + commit benchmark in temporary directories (`twig-bench` and `git-bench`). Repository initialization and synthetic file generation are excluded from both timers.
 
 ```bash
-./build/twig benchmark 200 256
+twig benchmark 200 256
 ```
 
 ### Sample Verified Output
