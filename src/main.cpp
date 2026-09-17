@@ -1,11 +1,25 @@
 #include "twig/repository.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
+
+bool is_tty_stdout() {
+    static const bool tty = []() {
+        const auto fd = 1;
+#ifdef _WIN32
+        return false;
+#else
+        return ::isatty(fd) != 0;
+#endif
+    }();
+    return tty && std::getenv("NO_COLOR") == nullptr;
+}
 
 void print_usage() {
     std::cout << "Twig - a lightweight custom VCS\n\n";
@@ -21,6 +35,18 @@ void print_usage() {
     std::cout << "  twig benchmark [files=1000] [size=1024]\n";
     std::cout << "  twig log\n";
     std::cout << "  twig help\n";
+}
+
+std::string green(const std::string& text) {
+    return is_tty_stdout() ? "\033[32m" + text + "\033[0m" : text;
+}
+
+std::string red(const std::string& text) {
+    return is_tty_stdout() ? "\033[31m" + text + "\033[0m" : text;
+}
+
+std::string yellow(const std::string& text) {
+    return is_tty_stdout() ? "\033[33m" + text + "\033[0m" : text;
 }
 
 }  // namespace
@@ -51,9 +77,50 @@ int main(int argc, char* argv[]) {
     }
 
     if (command == "status") {
-        const auto lines = repo.status();
-        for (const auto& line : lines) {
-            std::cout << line << std::endl;
+        const auto entries = repo.status_entries();
+        std::vector<twig::StatusEntry> staged;
+        std::vector<twig::StatusEntry> unstaged;
+        std::vector<twig::StatusEntry> untracked;
+        for (const auto& entry : entries) {
+            if (entry.category == "staged" || entry.category == "new file") {
+                staged.push_back(entry);
+            } else if (entry.category == "modified" || entry.category == "deleted") {
+                unstaged.push_back(entry);
+            } else if (entry.category == "untracked") {
+                untracked.push_back(entry);
+            }
+        }
+
+        std::cout << "On branch " << repo.current_branch() << std::endl;
+        if (entries.empty()) {
+            std::cout << "nothing to commit, working tree clean" << std::endl;
+            return 0;
+        }
+        if (!staged.empty()) {
+            std::cout << "Changes to be committed:" << std::endl;
+            std::cout << "  (use \"twig restore --staged <file>...\" to unstage)" << std::endl;
+            for (const auto& entry : staged) {
+                const auto label = entry.category == "new file" ? "new file:   " : "modified:   ";
+                std::cout << "\t" << green(label + entry.path) << std::endl;
+            }
+            std::cout << std::endl;
+        }
+        if (!unstaged.empty()) {
+            std::cout << "Changes not staged for commit:" << std::endl;
+            std::cout << "  (use \"twig add <file>...\" to update what will be committed)" << std::endl;
+            for (const auto& entry : unstaged) {
+                const auto label = entry.category == "deleted" ? "deleted:    " : "modified:   ";
+                std::cout << "\t" << red(label + entry.path) << std::endl;
+            }
+            std::cout << std::endl;
+        }
+        if (!untracked.empty()) {
+            std::cout << "Untracked files:" << std::endl;
+            std::cout << "  (use \"twig add <file>...\" to include in what will be committed)" << std::endl;
+            for (const auto& entry : untracked) {
+                std::cout << "\t" << red(entry.path) << std::endl;
+            }
+            std::cout << std::endl;
         }
         return 0;
     }
@@ -116,9 +183,13 @@ int main(int argc, char* argv[]) {
         }
 
         if (argc == 2) {
-            const auto branches = repo.list_branches();
+            const auto branches = repo.branch_entries();
             for (const auto& branch : branches) {
-                std::cout << branch << std::endl;
+                if (branch.current) {
+                    std::cout << green("* " + branch.name) << std::endl;
+                } else {
+                    std::cout << "  " << branch.name << std::endl;
+                }
             }
             return 0;
         }
@@ -165,7 +236,6 @@ int main(int argc, char* argv[]) {
 
         const auto diff_lines = repo.diff_file(argv[2]);
         if (diff_lines.empty()) {
-            std::cout << "No changes detected." << std::endl;
             return 0;
         }
 
@@ -184,7 +254,17 @@ int main(int argc, char* argv[]) {
             std::cerr << "Usage: twig merge <branch>" << std::endl;
             return 1;
         }
-        if (!repo.merge(argv[2])) {
+
+        const auto result = repo.merge(argv[2]);
+        if (!result.messages.empty()) {
+            for (const auto& line : result.messages) {
+                std::cout << line << std::endl;
+            }
+        }
+        if (result.status == twig::MergeStatus::Conflict) {
+            return 1;
+        }
+        if (result.status == twig::MergeStatus::Error) {
             std::cerr << "Merge failed." << std::endl;
             return 1;
         }
@@ -211,14 +291,26 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        const auto entries = repo.log();
+        const auto entries = repo.log_entries();
         if (entries.empty()) {
             std::cout << "No commits yet." << std::endl;
             return 0;
         }
 
-        for (const auto& entry : entries) {
-            std::cout << entry << std::endl;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto& entry = entries[i];
+            std::cout << yellow("commit " + entry.hash);
+            if (i == 0) {
+                std::cout << " (HEAD -> " << repo.current_branch() << ")";
+            }
+            std::cout << std::endl;
+            std::cout << "Author: " << entry.author << std::endl;
+            std::cout << "Date:   " << entry.date << std::endl;
+            std::cout << std::endl;
+            std::cout << "    " << entry.message << std::endl;
+            if (i + 1 < entries.size()) {
+                std::cout << std::endl;
+            }
         }
         return 0;
     }

@@ -179,6 +179,66 @@ std::vector<std::string> Repository::status() const {
     return lines;
 }
 
+std::vector<StatusEntry> Repository::status_entries() const {
+    std::vector<StatusEntry> results;
+    if (!is_initialized()) {
+        return results;
+    }
+
+    const auto head_entries = read_commit_entries(read_head_commit());
+    const auto index_entries = read_index_entries();
+    std::set<std::string> seen_files;
+    std::filesystem::recursive_directory_iterator it(root_, std::filesystem::directory_options::skip_permission_denied);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; it != end; ++it) {
+        const auto current_path = it->path();
+        if (std::filesystem::is_directory(current_path)) {
+            if (current_path.filename() == ".twig") {
+                it.disable_recursion_pending();
+            }
+            continue;
+        }
+        if (!std::filesystem::is_regular_file(current_path)) {
+            continue;
+        }
+        const auto relative = normalize_rel_path(current_path);
+        if (relative.empty() || relative.string() == ".twig") {
+            continue;
+        }
+        if (is_ignored(relative)) {
+            continue;
+        }
+        seen_files.insert(relative.string());
+    }
+
+    for (const auto& [path, hash] : index_entries) {
+        const auto relative = normalize_rel_path(path);
+        const auto abs_path = root_ / relative;
+        const auto head_it = head_entries.find(path);
+        if (head_it == head_entries.end()) {
+            results.push_back({"new file", relative.string()});
+        } else if (head_it->second != hash) {
+            results.push_back({"staged", relative.string()});
+        }
+
+        if (!std::filesystem::exists(abs_path)) {
+            results.push_back({"deleted", relative.string()});
+            continue;
+        }
+        const auto current_hash = blob_id_for_file(relative);
+        if (current_hash != hash) {
+            results.push_back({"modified", relative.string()});
+        }
+        seen_files.erase(relative.string());
+    }
+
+    for (const auto& path : seen_files) {
+        results.push_back({"untracked", path});
+    }
+
+    return results;
+}
+
 bool Repository::add_file(const std::filesystem::path& relative_path, bool quiet) {
     return add_files({relative_path}, quiet);
 }
@@ -281,9 +341,6 @@ bool Repository::add_files(const std::vector<std::filesystem::path>& relative_pa
             continue;
         }
         entries[normalized_string] = blob_id;
-        if (!quiet) {
-            std::cout << "staged: " << normalized << " -> " << blob_id << std::endl;
-        }
     }
 
     return write_index_entries(entries) && all_added;
@@ -449,14 +506,17 @@ bool Repository::checkout(const std::string& target) {
     return true;
 }
 
-bool Repository::merge(const std::string& branch_name) {
+MergeResult Repository::merge(const std::string& branch_name) {
+    MergeResult result;
+    result.status = MergeStatus::Error;
+
     if (!is_initialized() || branch_name.empty()) {
-        return false;
+        return result;
     }
 
     const auto target_ref = branch_ref_path(branch_name);
     if (!std::filesystem::exists(target_ref)) {
-        return false;
+        return result;
     }
 
     const auto current_head = read_head_commit();
@@ -464,12 +524,12 @@ bool Repository::merge(const std::string& branch_name) {
     if (current_head.empty() || target_head.empty() ||
         current_head == "0000000000000000000000000000000000000000" ||
         target_head == "0000000000000000000000000000000000000000") {
-        return false;
+        return result;
     }
 
     const auto merge_base = find_merge_base(current_head, target_head);
     if (merge_base.empty()) {
-        return false;
+        return result;
     }
 
     const auto base_entries = read_commit_entries(merge_base);
@@ -488,6 +548,8 @@ bool Repository::merge(const std::string& branch_name) {
 
     std::map<std::string, std::string> merged_index;
     std::map<std::string, std::string> merged_contents;
+    bool had_conflict = false;
+
     for (const auto& path : all_paths) {
         const auto base_it = base_entries.find(path);
         const auto ours_it = current_entries.find(path);
@@ -501,6 +563,8 @@ bool Repository::merge(const std::string& branch_name) {
         const std::string theirs_hash = has_theirs ? theirs_it->second : std::string{};
 
         std::string selected_hash;
+        bool path_conflict = false;
+
         if (has_ours == has_theirs && (!has_ours || ours_hash == theirs_hash)) {
             if (has_ours) {
                 selected_hash = ours_hash;
@@ -514,22 +578,90 @@ bool Repository::merge(const std::string& branch_name) {
                 selected_hash = ours_hash;
             }
         } else {
+            path_conflict = true;
             const auto base_data = has_base ? read_blob(base_hash) : std::string{};
             const auto ours_data = has_ours ? read_blob(ours_hash) : std::string{};
             const auto theirs_data = has_theirs ? read_blob(theirs_hash) : std::string{};
-            const auto merged_data = merge_text(base_data, ours_data, theirs_data);
-            if (!write_object("blob", merged_data, selected_hash)) {
-                return false;
+
+            std::string merged_data;
+            if (has_base && ((has_ours && !has_theirs) || (!has_ours && has_theirs))) {
+                const std::filesystem::path file_path = root_ / normalize_rel_path(path);
+                const auto modified_data = has_ours ? ours_data : theirs_data;
+                if (has_ours && !has_theirs) {
+                    result.messages.push_back("CONFLICT (modify/delete): " + path + " deleted in " + branch_name + " and modified in HEAD.  Version HEAD of " + path + " left in tree.");
+                } else {
+                    result.messages.push_back("CONFLICT (modify/delete): " + path + " deleted in HEAD and modified in " + branch_name + ".  Version " + branch_name + " of " + path + " left in tree.");
+                }
+                had_conflict = true;
+                std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+                out.write(modified_data.data(), static_cast<std::streamsize>(modified_data.size()));
+                selected_hash = has_ours ? ours_hash : theirs_hash;
+                merged_index[path] = selected_hash;
+                merged_contents[path] = modified_data;
+                continue;
             }
-            merged_contents[path] = merged_data;
+
+            if (!has_base && has_ours && has_theirs && ours_data != theirs_data) {
+                result.messages.push_back("Auto-merging " + path);
+                merged_data = merge_text(base_data, ours_data, theirs_data, branch_name);
+                if (merged_data.find("<<<<<<< HEAD\n") != std::string::npos) {
+                    had_conflict = true;
+                    result.messages.push_back("CONFLICT (add/add): Merge conflict in " + path);
+                }
+                if (!write_object("blob", merged_data, selected_hash)) {
+                    return result;
+                }
+                merged_contents[path] = merged_data;
+                merged_index[path] = selected_hash;
+                continue;
+            }
+
+            if (has_base || has_ours || has_theirs) {
+                result.messages.push_back("Auto-merging " + path);
+                merged_data = merge_text(base_data, ours_data, theirs_data, branch_name);
+                if (merged_data.find("<<<<<<< HEAD\n") != std::string::npos) {
+                    had_conflict = true;
+                    result.messages.push_back("CONFLICT (content): Merge conflict in " + path);
+                }
+                if (!write_object("blob", merged_data, selected_hash)) {
+                    return result;
+                }
+                merged_contents[path] = merged_data;
+            }
+            if (!selected_hash.empty()) {
+                merged_index[path] = selected_hash;
+            }
         }
 
-        if (!selected_hash.empty()) {
+        if (!path_conflict && !selected_hash.empty()) {
             merged_index[path] = selected_hash;
-            if (merged_contents.find(path) == merged_contents.end()) {
-                merged_contents[path] = read_blob(selected_hash);
-            }
+            merged_contents[path] = read_blob(selected_hash);
         }
+    }
+
+    if (had_conflict) {
+        result.status = MergeStatus::Conflict;
+        result.messages.push_back("Automatic merge failed; fix conflicts and then commit the result.");
+        std::set<std::string> written_paths;
+        for (const auto& [path, content] : merged_contents) {
+            if (written_paths.find(path) != written_paths.end()) {
+                continue;
+            }
+            const auto file_path = root_ / normalize_rel_path(path);
+            const auto parent = file_path.parent_path();
+            if (!parent.empty()) {
+                std::filesystem::create_directories(parent);
+            }
+            std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+            if (out) {
+                out.write(content.data(), static_cast<std::streamsize>(content.size()));
+            }
+            written_paths.insert(path);
+        }
+        if (!write_index_entries(merged_index)) {
+            result.status = MergeStatus::Error;
+        }
+        return result;
     }
 
     for (const auto& path : all_paths) {
@@ -538,9 +670,6 @@ bool Repository::merge(const std::string& branch_name) {
         if (content_it == merged_contents.end()) {
             std::error_code error;
             std::filesystem::remove(file_path, error);
-            if (error) {
-                return false;
-            }
             continue;
         }
         const auto parent = file_path.parent_path();
@@ -549,35 +678,82 @@ bool Repository::merge(const std::string& branch_name) {
         }
         std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
         if (!out) {
-            return false;
+            result.status = MergeStatus::Error;
+            return result;
         }
         out.write(content_it->second.data(), static_cast<std::streamsize>(content_it->second.size()));
-        if (!out) {
-            return false;
-        }
     }
-    return write_index_entries(merged_index);
+
+    if (!write_index_entries(merged_index)) {
+        result.status = MergeStatus::Error;
+        return result;
+    }
+
+    result.status = MergeStatus::Clean;
+    result.messages.clear();
+    return result;
 }
 
 std::vector<std::string> Repository::log() const {
     std::vector<std::string> history;
-    std::string current_hash = read_head_commit();
+    const auto entries = log_entries();
+    for (const auto& entry : entries) {
+        history.push_back(entry.hash + " " + entry.message);
+    }
+    return history;
+}
 
+std::vector<LogEntry> Repository::log_entries() const {
+    std::vector<LogEntry> history;
+    std::string current_hash = read_head_commit();
     while (!current_hash.empty() && current_hash != "0000000000000000000000000000000000000000") {
         const auto payload = read_object(current_hash);
         if (payload.empty()) {
             break;
         }
-
         const auto commit = parse_commit(payload);
-        history.push_back(current_hash + " " + commit.message);
+        LogEntry entry;
+        entry.hash = current_hash;
+        entry.author = commit.author;
+        entry.message = commit.message;
+        if (!commit.timestamp.empty()) {
+            const auto seconds = std::stoll(commit.timestamp);
+            const auto time = std::chrono::system_clock::from_time_t(static_cast<time_t>(seconds));
+            std::time_t now = std::chrono::system_clock::to_time_t(time);
+            std::tm tm_value = *std::localtime(&now);
+            std::ostringstream out;
+            out << std::put_time(&tm_value, "%a %b %-d %H:%M:%S %Y %z");
+            entry.date = out.str();
+        }
+        history.push_back(entry);
         if (commit.parent_hash.empty() || commit.parent_hash == "0000000000000000000000000000000000000000") {
             break;
         }
         current_hash = commit.parent_hash;
     }
-
     return history;
+}
+
+std::vector<BranchEntry> Repository::branch_entries() const {
+    std::vector<BranchEntry> branches;
+    const auto heads_dir = refs_dir() / "heads";
+    if (!std::filesystem::exists(heads_dir)) {
+        return branches;
+    }
+    std::vector<std::string> names;
+    for (const auto& entry : std::filesystem::directory_iterator(heads_dir)) {
+        if (entry.is_regular_file()) {
+            names.push_back(entry.path().filename().string());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        BranchEntry branch;
+        branch.name = name;
+        branch.current = (current_branch() == name);
+        branches.push_back(branch);
+    }
+    return branches;
 }
 
 std::string Repository::read_head_commit() const {
@@ -771,19 +947,45 @@ bool Repository::is_ignored(const std::filesystem::path& relative_path) const {
 std::vector<std::string> Repository::diff_file(const std::filesystem::path& relative_path) const {
     const auto normalized = normalize_rel_path(relative_path);
     const auto abs_path = root_ / normalized;
-    if (!std::filesystem::exists(abs_path)) {
-        return {};
-    }
-
     const auto entries = read_index_entries();
     const auto it = entries.find(normalized.string());
     if (it == entries.end()) {
         return {};
     }
 
-    const std::string old_text = read_blob(it->second);
+    const std::string old_hash = it->second;
+    const std::string old_text = read_blob(old_hash);
+    const auto path_string = normalized.generic_string();
+
+    if (!std::filesystem::exists(abs_path)) {
+        std::vector<std::string> out;
+        const auto hunks = compute_line_diff(old_text, "");
+        out.push_back("diff --git a/" + path_string + " b/" + path_string);
+        out.push_back("deleted file mode 100644");
+        out.push_back("index " + old_hash.substr(0, 7) + "..0000000");
+        out.push_back("--- a/" + path_string);
+        out.push_back("+++ /dev/null");
+        out.insert(out.end(), hunks.begin(), hunks.end());
+        return out;
+    }
+
     const std::string new_text = read_file_contents(abs_path);
-    return compute_line_diff(old_text, new_text);
+    if (old_text == new_text) {
+        return {};
+    }
+
+    const std::vector<std::string> hunks = compute_line_diff(old_text, new_text);
+    if (hunks.empty()) {
+        return {};
+    }
+
+    std::vector<std::string> out;
+    out.push_back("diff --git a/" + path_string + " b/" + path_string);
+    out.push_back("index " + old_hash.substr(0, 7) + ".." + blob_id_for_file(normalized).substr(0, 7) + " 100644");
+    out.push_back("--- a/" + path_string);
+    out.push_back("+++ b/" + path_string);
+    out.insert(out.end(), hunks.begin(), hunks.end());
+    return out;
 }
 
 std::vector<std::string> Repository::read_ignore_patterns() const {
@@ -879,17 +1081,40 @@ std::string Repository::read_file_contents(const std::filesystem::path& path) co
 }
 
 std::vector<std::string> Repository::compute_line_diff(const std::string& old_text, const std::string& new_text) const {
-    std::vector<std::string> old_lines;
-    std::vector<std::string> new_lines;
-    std::stringstream old_stream(old_text);
-    std::stringstream new_stream(new_text);
-    std::string line;
-    while (std::getline(old_stream, line)) {
-        old_lines.push_back(line);
+    auto split_lines = [](const std::string& text) {
+        std::vector<std::string> lines;
+        if (text.empty()) {
+            return lines;
+        }
+        size_t start = 0;
+        while (start < text.size()) {
+            const auto end = text.find('\n', start);
+            if (end == std::string::npos) {
+                lines.push_back(text.substr(start));
+                break;
+            }
+            lines.push_back(text.substr(start, end - start));
+            start = end + 1;
+        }
+        return lines;
+    };
+
+    const auto old_lines = split_lines(old_text);
+    const auto new_lines = split_lines(new_text);
+    if (old_text == new_text) {
+        return {};
     }
-    while (std::getline(new_stream, line)) {
-        new_lines.push_back(line);
-    }
+    const auto lines_equal = [&](size_t old_index, size_t new_index) {
+        if (old_lines[old_index] != new_lines[new_index]) {
+            return false;
+        }
+        const bool old_is_final = old_index + 1 == old_lines.size();
+        const bool new_is_final = new_index + 1 == new_lines.size();
+        if (old_is_final && new_is_final) {
+            return old_text.empty() || new_text.empty() || (old_text.back() == '\n') == (new_text.back() == '\n');
+        }
+        return true;
+    };
 
     const size_t rows = old_lines.size() + 1;
     const size_t cols = new_lines.size() + 1;
@@ -897,7 +1122,7 @@ std::vector<std::string> Repository::compute_line_diff(const std::string& old_te
 
     for (size_t i = 1; i < rows; ++i) {
         for (size_t j = 1; j < cols; ++j) {
-            if (old_lines[i - 1] == new_lines[j - 1]) {
+            if (lines_equal(i - 1, j - 1)) {
                 dp[i][j] = dp[i - 1][j - 1] + 1;
             } else {
                 dp[i][j] = std::max(dp[i - 1][j], dp[i][j - 1]);
@@ -905,33 +1130,104 @@ std::vector<std::string> Repository::compute_line_diff(const std::string& old_te
         }
     }
 
-    std::vector<std::string> result;
+    std::vector<std::pair<char, std::pair<size_t, size_t>>> ops;
     size_t i = old_lines.size();
     size_t j = new_lines.size();
     while (i > 0 && j > 0) {
-        if (old_lines[i - 1] == new_lines[j - 1]) {
-            result.push_back(" " + old_lines[i - 1]);
+        if (lines_equal(i - 1, j - 1)) {
+            ops.emplace_back(' ', std::make_pair(i - 1, j - 1));
             --i;
             --j;
         } else if (dp[i - 1][j] >= dp[i][j - 1]) {
-            result.push_back("-" + old_lines[i - 1]);
+            ops.emplace_back('-', std::make_pair(i - 1, j));
             --i;
         } else {
-            result.push_back("+" + new_lines[j - 1]);
+            ops.emplace_back('+', std::make_pair(i, j - 1));
             --j;
         }
     }
-
     while (i > 0) {
-        result.push_back("-" + old_lines[i - 1]);
+        ops.emplace_back('-', std::make_pair(i - 1, j));
         --i;
     }
     while (j > 0) {
-        result.push_back("+" + new_lines[j - 1]);
+        ops.emplace_back('+', std::make_pair(i, j - 1));
         --j;
     }
+    std::reverse(ops.begin(), ops.end());
 
-    std::reverse(result.begin(), result.end());
+    struct HunkRange {
+        size_t begin;
+        size_t end;
+    };
+    std::vector<HunkRange> hunks;
+    for (size_t op_index = 0; op_index < ops.size(); ++op_index) {
+        if (ops[op_index].first == ' ') {
+            continue;
+        }
+        const size_t begin = op_index > 3 ? op_index - 3 : 0;
+        const size_t end = std::min(ops.size(), op_index + 4);
+        if (!hunks.empty() && begin <= hunks.back().end) {
+            hunks.back().end = std::max(hunks.back().end, end);
+        } else {
+            hunks.push_back({begin, end});
+        }
+    }
+
+    const auto format_range = [](size_t start, size_t count) {
+        std::string value = std::to_string(start);
+        if (count != 1) {
+            value += "," + std::to_string(count);
+        }
+        return value;
+    };
+    std::vector<std::string> result;
+    for (const auto& hunk : hunks) {
+        size_t old_before = 0;
+        size_t new_before = 0;
+        size_t old_count = 0;
+        size_t new_count = 0;
+        for (size_t op_index = 0; op_index < hunk.begin; ++op_index) {
+            if (ops[op_index].first != '+') {
+                ++old_before;
+            }
+            if (ops[op_index].first != '-') {
+                ++new_before;
+            }
+        }
+        for (size_t op_index = hunk.begin; op_index < hunk.end; ++op_index) {
+            if (ops[op_index].first != '+') {
+                ++old_count;
+            }
+            if (ops[op_index].first != '-') {
+                ++new_count;
+            }
+        }
+        const size_t old_start = old_count == 0 ? old_before : old_before + 1;
+        const size_t new_start = new_count == 0 ? new_before : new_before + 1;
+        result.push_back("@@ -" + format_range(old_start, old_count) + " +" +
+                         format_range(new_start, new_count) + " @@");
+
+        for (size_t op_index = hunk.begin; op_index < hunk.end; ++op_index) {
+            const auto& [kind, indices] = ops[op_index];
+            if (kind == ' ') {
+                result.push_back(" " + old_lines[indices.first]);
+                if (indices.first + 1 == old_lines.size() && !old_text.empty() && old_text.back() != '\n') {
+                    result.push_back("\\ No newline at end of file");
+                }
+            } else if (kind == '-') {
+                result.push_back("-" + old_lines[indices.first]);
+                if (indices.first + 1 == old_lines.size() && !old_text.empty() && old_text.back() != '\n') {
+                    result.push_back("\\ No newline at end of file");
+                }
+            } else {
+                result.push_back("+" + new_lines[indices.second]);
+                if (indices.second + 1 == new_lines.size() && !new_text.empty() && new_text.back() != '\n') {
+                    result.push_back("\\ No newline at end of file");
+                }
+            }
+        }
+    }
     return result;
 }
 
@@ -945,7 +1241,9 @@ std::string Repository::read_blob_from_path(const std::filesystem::path& path) c
     return read_blob(it->second);
 }
 
-std::string Repository::merge_text(const std::string& base_text, const std::string& ours_text, const std::string& theirs_text) const {
+std::string Repository::merge_text(const std::string& base_text, const std::string& ours_text,
+                                  const std::string& theirs_text,
+                                  const std::string& theirs_label) const {
     if (base_text == ours_text) {
         return theirs_text;
     }
@@ -956,17 +1254,202 @@ std::string Repository::merge_text(const std::string& base_text, const std::stri
         return ours_text;
     }
 
-    std::ostringstream out;
-    out << "<<<<<<< HEAD\n" << ours_text;
-    if (!ours_text.empty() && ours_text.back() != '\n') {
-        out << '\n';
+    const auto split_lines = [](const std::string& text) {
+        std::vector<std::string> lines;
+        size_t start = 0;
+        while (start < text.size()) {
+            const auto end = text.find('\n', start);
+            if (end == std::string::npos) {
+                lines.push_back(text.substr(start));
+                break;
+            }
+            lines.push_back(text.substr(start, end - start));
+            start = end + 1;
+        }
+        return lines;
+    };
+    struct Edit {
+        size_t start;
+        size_t end;
+        std::vector<std::string> replacement;
+    };
+    const auto make_edits = [&](const std::vector<std::string>& variant) {
+        const auto base = split_lines(base_text);
+        const size_t rows = base.size() + 1;
+        const size_t cols = variant.size() + 1;
+        std::vector<std::vector<size_t>> lcs(rows, std::vector<size_t>(cols, 0));
+        for (size_t i = 1; i < rows; ++i) {
+            for (size_t j = 1; j < cols; ++j) {
+                lcs[i][j] = base[i - 1] == variant[j - 1]
+                                ? lcs[i - 1][j - 1] + 1
+                                : std::max(lcs[i - 1][j], lcs[i][j - 1]);
+            }
+        }
+        std::vector<std::pair<char, std::pair<size_t, size_t>>> ops;
+        size_t i = base.size();
+        size_t j = variant.size();
+        while (i > 0 && j > 0) {
+            if (base[i - 1] == variant[j - 1]) {
+                ops.push_back({' ', {i - 1, j - 1}});
+                --i;
+                --j;
+            } else if (lcs[i - 1][j] >= lcs[i][j - 1]) {
+                ops.push_back({'-', {i - 1, j}});
+                --i;
+            } else {
+                ops.push_back({'+', {i, j - 1}});
+                --j;
+            }
+        }
+        while (i > 0) {
+            ops.push_back({'-', {i - 1, j}});
+            --i;
+        }
+        while (j > 0) {
+            ops.push_back({'+', {i, j - 1}});
+            --j;
+        }
+        std::reverse(ops.begin(), ops.end());
+
+        std::vector<Edit> edits;
+        size_t base_pos = 0;
+        for (size_t op = 0; op < ops.size();) {
+            if (ops[op].first == ' ') {
+                ++base_pos;
+                ++op;
+                continue;
+            }
+            Edit edit{base_pos, base_pos, {}};
+            while (op < ops.size() && ops[op].first != ' ') {
+                if (ops[op].first == '-') {
+                    ++base_pos;
+                    edit.end = base_pos;
+                } else {
+                    edit.replacement.push_back(variant[ops[op].second.second]);
+                }
+                ++op;
+            }
+            edits.push_back(std::move(edit));
+        }
+        return edits;
+    };
+
+    const auto base = split_lines(base_text);
+    const auto ours = split_lines(ours_text);
+    const auto theirs = split_lines(theirs_text);
+    const auto ours_edits = make_edits(ours);
+    const auto theirs_edits = make_edits(theirs);
+    std::vector<std::string> merged;
+    size_t cursor = 0;
+    size_t oi = 0;
+    size_t ti = 0;
+    bool has_conflict = false;
+
+    const auto append_base = [&](size_t begin, size_t end, std::vector<std::string>& destination) {
+        for (size_t line = begin; line < end && line < base.size(); ++line) {
+            destination.push_back(base[line]);
+        }
+    };
+    const auto apply_edits = [&](const std::vector<Edit>& edits, size_t first, size_t last,
+                                 size_t begin, size_t end) {
+        std::vector<std::string> output;
+        size_t position = begin;
+        for (size_t index = first; index < last; ++index) {
+            const auto& edit = edits[index];
+            append_base(position, edit.start, output);
+            output.insert(output.end(), edit.replacement.begin(), edit.replacement.end());
+            position = edit.end;
+        }
+        append_base(position, end, output);
+        return output;
+    };
+    const auto append_lines = [&](const std::vector<std::string>& lines) {
+        merged.insert(merged.end(), lines.begin(), lines.end());
+    };
+
+    while (oi < ours_edits.size() || ti < theirs_edits.size()) {
+        const size_t ours_start = oi < ours_edits.size() ? ours_edits[oi].start : std::numeric_limits<size_t>::max();
+        const size_t theirs_start = ti < theirs_edits.size() ? theirs_edits[ti].start : std::numeric_limits<size_t>::max();
+        const size_t next_start = std::min(ours_start, theirs_start);
+        append_base(cursor, next_start, merged);
+        size_t cluster_start = next_start;
+        size_t cluster_end = cluster_start;
+        size_t ours_end = oi;
+        size_t theirs_end = ti;
+        if (ours_start == next_start) {
+            cluster_end = std::max(cluster_end, ours_edits[ours_end++].end);
+        }
+        if (theirs_start == next_start) {
+            cluster_end = std::max(cluster_end, theirs_edits[theirs_end++].end);
+        }
+        bool expanded = true;
+        while (expanded) {
+            expanded = false;
+            while (ours_end < ours_edits.size() && ours_edits[ours_end].start <= cluster_end) {
+                cluster_end = std::max(cluster_end, ours_edits[ours_end].end);
+                ++ours_end;
+                expanded = true;
+            }
+            while (theirs_end < theirs_edits.size() && theirs_edits[theirs_end].start <= cluster_end) {
+                cluster_end = std::max(cluster_end, theirs_edits[theirs_end].end);
+                ++theirs_end;
+                expanded = true;
+            }
+        }
+        const auto ours_region = apply_edits(ours_edits, oi, ours_end, cluster_start, cluster_end);
+        const auto theirs_region = apply_edits(theirs_edits, ti, theirs_end, cluster_start, cluster_end);
+        if (oi == ours_end) {
+            append_lines(theirs_region);
+        } else if (ti == theirs_end) {
+            append_lines(ours_region);
+        } else if (ours_region == theirs_region) {
+            append_lines(ours_region);
+        } else {
+            has_conflict = true;
+            size_t common_prefix = 0;
+            while (common_prefix < ours_region.size() && common_prefix < theirs_region.size() &&
+                   ours_region[common_prefix] == theirs_region[common_prefix]) {
+                merged.push_back(ours_region[common_prefix]);
+                ++common_prefix;
+            }
+            size_t common_suffix = 0;
+            while (common_suffix + common_prefix < ours_region.size() &&
+                   common_suffix + common_prefix < theirs_region.size() &&
+                   ours_region[ours_region.size() - common_suffix - 1] ==
+                       theirs_region[theirs_region.size() - common_suffix - 1]) {
+                ++common_suffix;
+            }
+            merged.push_back("<<<<<<< HEAD");
+            merged.insert(merged.end(), ours_region.begin() + static_cast<std::ptrdiff_t>(common_prefix),
+                          ours_region.end() - static_cast<std::ptrdiff_t>(common_suffix));
+            merged.push_back("=======");
+            merged.insert(merged.end(), theirs_region.begin() + static_cast<std::ptrdiff_t>(common_prefix),
+                          theirs_region.end() - static_cast<std::ptrdiff_t>(common_suffix));
+            merged.push_back(">>>>>>> " + theirs_label);
+            if (common_suffix > 0) {
+                merged.insert(merged.end(), ours_region.end() - static_cast<std::ptrdiff_t>(common_suffix),
+                              ours_region.end());
+            }
+        }
+        cursor = cluster_end;
+        oi = ours_end;
+        ti = theirs_end;
     }
-    out << "=======\n" << theirs_text;
-    if (!theirs_text.empty() && theirs_text.back() != '\n') {
-        out << '\n';
+    append_base(cursor, base.size(), merged);
+
+    if (!has_conflict && ours_text == theirs_text) {
+        return ours_text;
     }
-    out << ">>>>>>> merge\n";
-    return out.str();
+    const bool preserve_final_newline = (!ours_text.empty() && ours_text.back() == '\n') ||
+                                        (!theirs_text.empty() && theirs_text.back() == '\n');
+    std::string output;
+    for (size_t index = 0; index < merged.size(); ++index) {
+        output += merged[index];
+        if (index + 1 < merged.size() || preserve_final_newline) {
+            output += '\n';
+        }
+    }
+    return output;
 }
 
 std::string Repository::branch_ref() const {
