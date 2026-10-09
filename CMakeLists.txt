@@ -12,9 +12,16 @@ option(TWIG_ENABLE_ASAN "Enable AddressSanitizer and UBSan" OFF)
 
 enable_testing()
 
+set(TWIG_REPOSITORY_SOURCES
+    src/repository.cpp
+    src/repository_status.cpp
+    src/repository_diff.cpp
+    src/repository_merge_text.cpp
+)
+
 add_executable(twig
     src/main.cpp
-    src/repository.cpp
+    ${TWIG_REPOSITORY_SOURCES}
 )
 
 target_include_directories(twig
@@ -28,7 +35,7 @@ install(TARGETS twig
 
 add_executable(twig_test
     tests/repository_test.cpp
-    src/repository.cpp
+    ${TWIG_REPOSITORY_SOURCES}
 )
 
 target_include_directories(twig_test

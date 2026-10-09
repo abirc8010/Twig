@@ -100,7 +100,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Changes to be committed:" << std::endl;
             std::cout << "  (use \"twig restore --staged <file>...\" to unstage)" << std::endl;
             for (const auto& entry : staged) {
-                const auto label = entry.category == "new file" ? "new file:   " : "modified:   ";
+                const std::string label = (entry.category == "new file") ? "new file:   " : "modified:   ";
                 std::cout << "\t" << green(label + entry.path) << std::endl;
             }
             std::cout << std::endl;
@@ -109,7 +109,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Changes not staged for commit:" << std::endl;
             std::cout << "  (use \"twig add <file>...\" to update what will be committed)" << std::endl;
             for (const auto& entry : unstaged) {
-                const auto label = entry.category == "deleted" ? "deleted:    " : "modified:   ";
+                const std::string label = (entry.category == "deleted") ? "deleted:    " : "modified:   ";
                 std::cout << "\t" << red(label + entry.path) << std::endl;
             }
             std::cout << std::endl;

@@ -27,7 +27,10 @@ twig/
 │       └── repository.hpp
 ├── src/
 │   ├── main.cpp
-│   └── repository.cpp
+│   ├── repository.cpp
+│   ├── repository_status.cpp
+│   ├── repository_diff.cpp
+│   └── repository_merge_text.cpp
 └── tests/
     └── repository_test.cpp
 ```
@@ -63,7 +66,19 @@ ctest --test-dir build --output-on-failure
 
 ### Install `twig` for terminal-wide use (Linux)
 
-Install the executable into `~/.local/bin`:
+The root `.install.sh` script builds the Release executable and installs it into `~/.local/bin` by default:
+
+```bash
+bash .install.sh
+```
+
+Choose a different install prefix or build directory with `--prefix` and `--build-dir`. For example:
+
+```bash
+bash .install.sh --prefix "$HOME/.local" --build-dir build
+```
+
+Alternatively, run the CMake install steps manually:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
